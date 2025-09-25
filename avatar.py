@@ -1,68 +1,200 @@
-import os
-import argparse
+import cv2
+import numpy as np
 from PIL import Image, ImageDraw
-import zipfile
+import os
+from pathlib import Path
 
-def split_avatars(input_path, rows=8, cols=8, output_dir="avatars_circles"):
-    # Create output directory if not exists
-    os.makedirs(output_dir, exist_ok=True)
+def extract_avatars_from_grid(image_path, output_folder='avatars'):
+    """
+    Extract individual circular avatars from a grid image.
+    
+    Args:
+        image_path: Path to the input PNG image
+        output_folder: Folder where individual avatars will be saved
+    """
+    
+    # Create output directory if it doesn't exist
+    Path(output_folder).mkdir(parents=True, exist_ok=True)
+    
+    # Load the image
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"Could not load image from {image_path}")
+    
+    # If image has alpha channel, use it; otherwise create one
+    if img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    
+    # Convert to RGB for circle detection
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+    
+    # Convert to grayscale for circle detection
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    
+    # Detect circles using Hough Circle Transform
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=80,  # Minimum distance between circle centers
+        param1=50,   # Higher threshold for Canny edge detector
+        param2=30,   # Accumulator threshold for circle centers
+        minRadius=40,  # Minimum circle radius
+        maxRadius=70   # Maximum circle radius
+    )
+    
+    if circles is None:
+        print("No circles detected. Trying alternative method...")
+        circles = detect_circles_alternative(gray)
+    
+    if circles is not None:
+        # Round the circle parameters and convert to integers
+        circles = np.uint16(np.around(circles))
+        
+        # Sort circles by position (top to bottom, left to right)
+        circle_list = []
+        for circle in circles[0, :]:
+            circle_list.append(circle)
+        
+        # Sort by row first (y-coordinate), then by column (x-coordinate)
+        circle_list.sort(key=lambda c: (c[1], c[0]))
+        
+        # Group circles into rows based on y-coordinate proximity
+        rows = []
+        current_row = []
+        row_y = None
+        y_threshold = 30  # Maximum y-difference to be considered same row
+        
+        for circle in circle_list:
+            if row_y is None or abs(circle[1] - row_y) < y_threshold:
+                current_row.append(circle)
+                if row_y is None:
+                    row_y = circle[1]
+            else:
+                # Sort current row by x-coordinate
+                current_row.sort(key=lambda c: c[0])
+                rows.append(current_row)
+                current_row = [circle]
+                row_y = circle[1]
+        
+        # Don't forget the last row
+        if current_row:
+            current_row.sort(key=lambda c: c[0])
+            rows.append(current_row)
+        
+        # Flatten the sorted circles back into a single list
+        sorted_circles = []
+        for row in rows:
+            sorted_circles.extend(row)
+        
+        print(f"Detected {len(sorted_circles)} avatars")
+        
+        # Extract each avatar
+        for idx, (x, y, r) in enumerate(sorted_circles, 1):
+            # Create a mask for the circular region
+            mask = np.zeros((img.shape[0], img.shape[1]), dtype=np.uint8)
+            cv2.circle(mask, (x, y), r, 255, -1)
+            
+            # Calculate bounding box for the circle
+            x_min = max(0, x - r)
+            x_max = min(img.shape[1], x + r)
+            y_min = max(0, y - r)
+            y_max = min(img.shape[0], y + r)
+            
+            # Crop the region
+            cropped = img[y_min:y_max, x_min:x_max].copy()
+            mask_cropped = mask[y_min:y_max, x_min:x_max]
+            
+            # Convert to PIL Image
+            pil_img = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGRA2RGBA))
+            
+            # Create a new image with transparent background
+            output_size = (r * 2, r * 2)
+            output_img = Image.new('RGBA', output_size, (0, 0, 0, 0))
+            
+            # Create circular mask for the output
+            mask_output = Image.new('L', output_size, 0)
+            mask_draw = ImageDraw.Draw(mask_output)
+            mask_draw.ellipse([0, 0, output_size[0]-1, output_size[1]-1], fill=255)
+            
+            # Calculate paste position to center the cropped image
+            paste_x = r - (x - x_min)
+            paste_y = r - (y - y_min)
+            
+            # Paste the cropped image onto the output
+            output_img.paste(pil_img, (paste_x, paste_y))
+            
+            # Apply the circular mask
+            output_img.putalpha(mask_output)
+            
+            # Save the individual avatar
+            output_path = os.path.join(output_folder, f'avatar_{idx}.png')
+            output_img.save(output_path, 'PNG')
+            print(f"Saved avatar_{idx}.png")
+    
+    else:
+        print("No circles could be detected in the image")
+        return False
+    
+    print(f"\nExtraction complete! {len(sorted_circles)} avatars saved to '{output_folder}/' folder")
+    return True
 
-    # Open the image
-    img = Image.open(input_path).convert("RGBA")
-    img_width, img_height = img.size
+def detect_circles_alternative(gray):
+    """
+    Alternative method to detect circles if HoughCircles fails.
+    Uses contour detection to find circular shapes.
+    """
+    # Apply threshold
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    
+    # Find contours
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    circles = []
+    for contour in contours:
+        # Calculate area and perimeter
+        area = cv2.contourArea(contour)
+        if area < 1000:  # Skip small contours
+            continue
+        
+        # Fit a circle to the contour
+        (x, y), radius = cv2.minEnclosingCircle(contour)
+        
+        # Check if the contour is circular enough
+        circularity = 4 * np.pi * area / (cv2.arcLength(contour, True) ** 2)
+        if circularity > 0.7 and 40 < radius < 70:
+            circles.append([x, y, radius])
+    
+    if circles:
+        return np.array([circles], dtype=np.float32)
+    return None
 
-    # Avatar size
-    avatar_w = img_width // cols
-    avatar_h = img_height // rows
-
-    count = 1
-    for row in range(rows):
-        for col in range(cols):
-            left = col * avatar_w
-            upper = row * avatar_h
-            right = left + avatar_w
-            lower = upper + avatar_h
-
-            # Crop rectangular tile
-            avatar_tile = img.crop((left, upper, right, lower))
-
-            # Find the largest centered square in the tile
-            tile_w, tile_h = avatar_tile.size
-            min_side = min(tile_w, tile_h)
-            left_sq = (tile_w - min_side) // 2
-            upper_sq = (tile_h - min_side) // 2
-            right_sq = left_sq + min_side
-            lower_sq = upper_sq + min_side
-            avatar_square = avatar_tile.crop((left_sq, upper_sq, right_sq, lower_sq))
-
-            # Create circular mask
-            mask = Image.new("L", (min_side, min_side), 0)
-            draw = ImageDraw.Draw(mask)
-            draw.ellipse((0, 0, min_side, min_side), fill=255)
-
-            # Apply mask
-            avatar_circle = Image.new("RGBA", (min_side, min_side))
-            avatar_circle.paste(avatar_square, (0, 0), mask=mask)
-
-            # Save
-            avatar_circle.save(os.path.join(output_dir, f"avatar_{count}.png"))
-            count += 1
-
-    # Create ZIP file
-    zip_path = f"{output_dir}.zip"
-    with zipfile.ZipFile(zip_path, 'w') as zipf:
-        for file in os.listdir(output_dir):
-            zipf.write(os.path.join(output_dir, file), file)
-
-    print(f"✅ Done! Saved {count-1} circular avatars in '{output_dir}'")
-    print(f"📦 Zipped avatars saved at: {zip_path}")
+def main():
+    """
+    Main function to run the avatar extraction.
+    """
+    # Input image path
+    image_path = 'avatar_grid.png'  # Change this to your image path
+    
+    # Output folder
+    output_folder = 'avatars'
+    
+    # Check if input file exists
+    if not os.path.exists(image_path):
+        print(f"Error: Image file '{image_path}' not found!")
+        print("Please ensure the image file is in the correct location.")
+        return
+    
+    # Extract avatars
+    try:
+        success = extract_avatars_from_grid(image_path, output_folder)
+        if success:
+            print("\n✅ Success! Check the 'avatars' folder for the extracted images.")
+    except Exception as e:
+        print(f"Error occurred: {str(e)}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Split avatar grid into circular PNGs.")
-    parser.add_argument("input", help="Path to input image")
-    parser.add_argument("--rows", type=int, default=8, help="Number of rows in grid (default: 8)")
-    parser.add_argument("--cols", type=int, default=8, help="Number of columns in grid (default: 8)")
-    parser.add_argument("--output", type=str, default="avatars_circles", help="Output folder name")
-
-    args = parser.parse_args()
-    split_avatars(args.input, args.rows, args.cols, args.output)
+    main()
