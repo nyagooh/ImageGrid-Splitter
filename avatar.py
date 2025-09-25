@@ -23,12 +23,17 @@ def split_avatars(input_path, rows=8, cols=8, output_dir="avatars_circles"):
             right = left + avatar_w
             lower = upper + avatar_h
 
-            # Crop square tile
-            avatar = img.crop((left, upper, right, lower))
+            # Crop rectangular tile
+            avatar_tile = img.crop((left, upper, right, lower))
 
-            # Ensure square crop for perfect circle
-            min_side = min(avatar_w, avatar_h)
-            avatar = avatar.crop((0, 0, min_side, min_side))
+            # Find the largest centered square in the tile
+            tile_w, tile_h = avatar_tile.size
+            min_side = min(tile_w, tile_h)
+            left_sq = (tile_w - min_side) // 2
+            upper_sq = (tile_h - min_side) // 2
+            right_sq = left_sq + min_side
+            lower_sq = upper_sq + min_side
+            avatar_square = avatar_tile.crop((left_sq, upper_sq, right_sq, lower_sq))
 
             # Create circular mask
             mask = Image.new("L", (min_side, min_side), 0)
@@ -37,7 +42,7 @@ def split_avatars(input_path, rows=8, cols=8, output_dir="avatars_circles"):
 
             # Apply mask
             avatar_circle = Image.new("RGBA", (min_side, min_side))
-            avatar_circle.paste(avatar, (0, 0), mask=mask)
+            avatar_circle.paste(avatar_square, (0, 0), mask=mask)
 
             # Save
             avatar_circle.save(os.path.join(output_dir, f"avatar_{count}.png"))
